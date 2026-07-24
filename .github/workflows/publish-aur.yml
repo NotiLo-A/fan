@@ -1,0 +1,93 @@
+name: Publish AUR package
+
+on:
+  push:
+    tags:
+      - '*.*.*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aur-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out release
+        uses: actions/checkout@v4
+
+      - name: Validate version tag
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Expected a version tag in X.Y.Z format, got: $version" >&2
+            exit 1
+          fi
+
+          cargo_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [[ "$cargo_version" != "$version" ]]; then
+            echo "Tag $version does not match Cargo.toml version $cargo_version" >&2
+            exit 1
+          fi
+
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare package recipe
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive_url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${VERSION}.tar.gz"
+          checksum="$(curl --fail --location --silent --show-error "$archive_url" | sha256sum | cut -d ' ' -f 1)"
+          sed -i "s/^pkgver=.*/pkgver=${VERSION}/" packaging/aur/PKGBUILD
+          sed -i "s/^sha256sums=.*/sha256sums=('${checksum}')/" packaging/aur/PKGBUILD
+
+      - name: Build and validate package
+        shell: bash
+        run: |
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/workspace" \
+            archlinux:base-devel \
+            bash -c "pacman -Syu --noconfirm rust git &&
+              useradd --create-home --uid $(id -u) builder &&
+              su builder -c 'cd /workspace/packaging/aur && makepkg --syncdeps --noconfirm --cleanbuild && makepkg --printsrcinfo > .SRCINFO'"
+
+      - name: Configure AUR SSH key
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$AUR_SSH_PRIVATE_KEY"
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts
+
+      - name: Publish to AUR
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/aur -o IdentitiesOnly=yes"
+          git clone ssh://aur@aur.archlinux.org/fan.git aur-repository
+          install -Dm644 packaging/aur/PKGBUILD aur-repository/PKGBUILD
+          install -Dm644 packaging/aur/.SRCINFO aur-repository/.SRCINFO
+          cd aur-repository
+          git config user.name "NotiLo-A"
+          git config user.email "ninedefix@proton.me"
+          git add PKGBUILD .SRCINFO
+          if git diff --cached --quiet; then
+            echo "AUR package is already up to date"
+            exit 0
+          fi
+          git commit -m "Update to ${VERSION}"
+          git push origin master
