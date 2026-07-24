@@ -148,19 +148,28 @@ jobs:
           tar -C dist -czf "fan-${VERSION}-x86_64-linux.tar.gz" fan
           sha256sum "fan-${VERSION}-x86_64-linux.tar.gz" > "fan-${VERSION}-x86_64-linux.tar.gz.sha256"
 
-      - name: Create GitHub release
+      - name: Create or update GitHub release
         env:
           VERSION: ${{ needs.validate.outputs.version }}
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          gh release create "$VERSION" \
-            "fan-${VERSION}-x86_64-linux.tar.gz" \
-            "fan-${VERSION}-x86_64-linux.tar.gz.sha256" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "$VERSION" \
-            --generate-notes
+          if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $VERSION already exists, uploading assets (overwrite)"
+            gh release upload "$VERSION" \
+              "fan-${VERSION}-x86_64-linux.tar.gz" \
+              "fan-${VERSION}-x86_64-linux.tar.gz.sha256" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          else
+            gh release create "$VERSION" \
+              "fan-${VERSION}-x86_64-linux.tar.gz" \
+              "fan-${VERSION}-x86_64-linux.tar.gz.sha256" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$VERSION" \
+              --generate-notes
+          fi
 
   publish-aur:
     needs: [validate, build-and-check, github-release]
@@ -178,16 +187,10 @@ jobs:
         with:
           ssh-private-key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
 
-      - name: Add AUR host key
-        shell: bash
-        run: |
-          set -euo pipefail
-          install -d -m 700 ~/.ssh
-          ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
-
       - name: Publish to AUR
         env:
           VERSION: ${{ needs.validate.outputs.version }}
+          GIT_SSH_COMMAND: ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
         shell: bash
         run: |
           set -euo pipefail
