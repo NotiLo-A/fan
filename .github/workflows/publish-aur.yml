@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Тег релиза для публикации (например 1.0.6). Тег должен уже существовать.'
+        description: 'tag'
         required: true
         type: string
 
