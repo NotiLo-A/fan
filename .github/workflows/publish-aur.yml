@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'tag'
+        description: 'Tag'
         required: true
         type: string
 
@@ -19,16 +19,15 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  validate:
+  publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      version: ${{ steps.version.outputs.value }}
+    timeout-minutes: 30
     steps:
       - name: Check out release
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag || github.ref_name }}
+          fetch-depth: 0
 
       - name: Validate version tag matches Cargo.toml
         id: version
@@ -57,22 +56,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git fetch origin "${{ github.event.repository.default_branch }}" --depth=200
-          checked_out_sha="$(git rev-parse HEAD)"
-          if ! git merge-base --is-ancestor "$checked_out_sha" "origin/${{ github.event.repository.default_branch }}"; then
+          git fetch origin "${{ github.event.repository.default_branch }}"
+          if ! git merge-base --is-ancestor HEAD "origin/${{ github.event.repository.default_branch }}"; then
             echo "Tag commit is not part of the default branch history" >&2
             exit 1
           fi
-
-  build-and-check:
-    needs: validate
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - name: Check out release
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.tag || github.ref_name }}
 
       - name: Run tests
         shell: bash
@@ -88,7 +76,7 @@ jobs:
 
       - name: Prepare AUR package recipe
         env:
-          VERSION: ${{ needs.validate.outputs.version }}
+          VERSION: ${{ steps.version.outputs.value }}
         shell: bash
         run: |
           set -euo pipefail
@@ -121,59 +109,26 @@ jobs:
               test -f /workspace/packaging/aur/.SRCINFO
             "
 
-      - name: Upload prepared PKGBUILD artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: aur-recipe
-          path: |
-            packaging/aur/PKGBUILD
-            packaging/aur/.SRCINFO
-          retention-days: 1
-          if-no-files-found: error
-
-      - name: Upload release binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-binary
-          path: target/release/fan
-          retention-days: 1
-          if-no-files-found: error
-
-  github-release:
-    needs: [validate, build-and-check]
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Check out release
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.tag || github.ref_name }}
-
-      - name: Download release binary
-        uses: actions/download-artifact@v4
-        with:
-          name: release-binary
-          path: dist
-
-      - name: Package binary and checksum
+      - name: Package binary and checksum for GitHub release
         env:
-          VERSION: ${{ needs.validate.outputs.version }}
+          VERSION: ${{ steps.version.outputs.value }}
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p dist
+          cp target/release/fan dist/fan
           chmod +x dist/fan
           tar -C dist -czf "fan-${VERSION}-x86_64-linux.tar.gz" fan
           sha256sum "fan-${VERSION}-x86_64-linux.tar.gz" > "fan-${VERSION}-x86_64-linux.tar.gz.sha256"
 
-      - name: Create or update GitHub release
+      - name: Create GitHub release
         env:
-          VERSION: ${{ needs.validate.outputs.version }}
+          VERSION: ${{ steps.version.outputs.value }}
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
           if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "Release $VERSION already exists, uploading assets (overwrite)"
             gh release upload "$VERSION" \
               "fan-${VERSION}-x86_64-linux.tar.gz" \
               "fan-${VERSION}-x86_64-linux.tar.gz.sha256" \
@@ -188,26 +143,21 @@ jobs:
               --generate-notes
           fi
 
-  publish-aur:
-    needs: [validate, build-and-check, github-release]
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Download prepared PKGBUILD artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: aur-recipe
-          path: packaging/aur
-
-      - name: Configure AUR SSH access
-        uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+      - name: Configure AUR SSH key
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$AUR_SSH_PRIVATE_KEY"
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
 
       - name: Publish to AUR
         env:
-          VERSION: ${{ needs.validate.outputs.version }}
-          GIT_SSH_COMMAND: ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+          VERSION: ${{ steps.version.outputs.value }}
+          GIT_SSH_COMMAND: ssh -i /home/runner/.ssh/aur -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
         shell: bash
         run: |
           set -euo pipefail
