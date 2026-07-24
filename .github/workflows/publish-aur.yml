@@ -1,4 +1,4 @@
-name: Publish AUR package
+name: Publish release
 
 on:
   push:
@@ -6,20 +6,23 @@ on:
       - '*.*.*'
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
-  group: aur-publish
+  group: publish-${{ github.ref_name }}
   cancel-in-progress: false
 
 jobs:
-  publish:
+  validate:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.value }}
     steps:
       - name: Check out release
         uses: actions/checkout@v4
 
-      - name: Validate version tag
+      - name: Validate version tag matches Cargo.toml
         id: version
         shell: bash
         run: |
@@ -29,55 +32,167 @@ jobs:
             echo "Expected a version tag in X.Y.Z format, got: $version" >&2
             exit 1
           fi
-
           cargo_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
           if [[ "$cargo_version" != "$version" ]]; then
             echo "Tag $version does not match Cargo.toml version $cargo_version" >&2
             exit 1
           fi
-
           echo "value=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Prepare package recipe
+      - name: Check Cargo.lock is up to date
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo update --locked --dry-run
+
+      - name: Check tag points at HEAD of default branch history
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin "${{ github.event.repository.default_branch }}" --depth=200
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" "origin/${{ github.event.repository.default_branch }}"; then
+            echo "Tag commit is not part of the default branch history" >&2
+            exit 1
+          fi
+
+  build-and-check:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out release
+        uses: actions/checkout@v4
+
+      - name: Run tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --all-features
+
+      - name: Build release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release
+
+      - name: Prepare AUR package recipe
         env:
-          VERSION: ${{ steps.version.outputs.value }}
+          VERSION: ${{ needs.validate.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
           archive_url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${VERSION}.tar.gz"
-          checksum="$(curl --fail --location --silent --show-error "$archive_url" | sha256sum | cut -d ' ' -f 1)"
+          checksum="$(curl --fail --location --silent --show-error --retry 5 --retry-delay 3 "$archive_url" | sha256sum | cut -d ' ' -f 1)"
           sed -i "s/^pkgver=.*/pkgver=${VERSION}/" packaging/aur/PKGBUILD
           sed -i "s/^sha256sums=.*/sha256sums=('${checksum}')/" packaging/aur/PKGBUILD
 
-      - name: Build and validate package
+      - name: Build and validate AUR package
         shell: bash
         run: |
+          set -euo pipefail
           docker run --rm \
             --volume "$GITHUB_WORKSPACE:/workspace" \
             archlinux:base-devel \
-            bash -c "pacman -Syu --noconfirm rust git &&
-              useradd --create-home --uid $(id -u) builder &&
-              su builder -c 'cd /workspace/packaging/aur && makepkg --syncdeps --noconfirm --cleanbuild && makepkg --printsrcinfo > .SRCINFO'"
+            bash -c "
+              set -euo pipefail
+              pacman -Syu --noconfirm rust git namcap
+              useradd --create-home --uid $(id -u) builder
+              su builder -c '
+                set -euo pipefail
+                cd /workspace/packaging/aur
+                makepkg --syncdeps --noconfirm --cleanbuild
+                makepkg --printsrcinfo > .SRCINFO
+                namcap PKGBUILD
+                namcap ./*.pkg.tar.zst
+              '
+            "
 
-      - name: Configure AUR SSH key
+      - name: Upload prepared PKGBUILD artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: aur-recipe
+          path: |
+            packaging/aur/PKGBUILD
+            packaging/aur/.SRCINFO
+          retention-days: 1
+
+      - name: Upload release binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-binary
+          path: target/release/fan
+          retention-days: 1
+          if-no-files-found: error
+
+  github-release:
+    needs: [validate, build-and-check]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out release
+        uses: actions/checkout@v4
+
+      - name: Download release binary
+        uses: actions/download-artifact@v4
+        with:
+          name: release-binary
+          path: dist
+
+      - name: Package binary and checksum
         env:
-          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          VERSION: ${{ needs.validate.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
-          test -n "$AUR_SSH_PRIVATE_KEY"
+          chmod +x dist/fan
+          tar -C dist -czf "fan-${VERSION}-x86_64-linux.tar.gz" fan
+          sha256sum "fan-${VERSION}-x86_64-linux.tar.gz" > "fan-${VERSION}-x86_64-linux.tar.gz.sha256"
+
+      - name: Create GitHub release
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$VERSION" \
+            "fan-${VERSION}-x86_64-linux.tar.gz" \
+            "fan-${VERSION}-x86_64-linux.tar.gz.sha256" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$VERSION" \
+            --generate-notes
+
+  publish-aur:
+    needs: [validate, build-and-check, github-release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download prepared PKGBUILD artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: aur-recipe
+          path: packaging/aur
+
+      - name: Configure AUR SSH access
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+
+      - name: Pin AUR host key
+        shell: bash
+        run: |
+          set -euo pipefail
           install -d -m 700 ~/.ssh
-          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur
-          chmod 600 ~/.ssh/aur
-          ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts
+          cat >> ~/.ssh/known_hosts <<'EOF'
+          aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK1YVL2elhIjjaGaW0mQ5J2m8dQoJyeLMMTOAeouJgS/
+          EOF
 
       - name: Publish to AUR
         env:
-          VERSION: ${{ steps.version.outputs.value }}
+          VERSION: ${{ needs.validate.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
-          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/aur -o IdentitiesOnly=yes"
           git clone ssh://aur@aur.archlinux.org/fan.git aur-repository
           install -Dm644 packaging/aur/PKGBUILD aur-repository/PKGBUILD
           install -Dm644 packaging/aur/.SRCINFO aur-repository/.SRCINFO
