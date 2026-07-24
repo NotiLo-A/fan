@@ -178,14 +178,25 @@ jobs:
         with:
           ssh-private-key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
 
-      - name: Pin AUR host key
+      - name: Fetch and verify AUR host key
         shell: bash
         run: |
           set -euo pipefail
           install -d -m 700 ~/.ssh
-          cat >> ~/.ssh/known_hosts <<'EOF'
-          aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK1YVL2elhIjjaGaW0mQ5J2m8dQoJyeLMMTOAeouJgS/
-          EOF
+
+          expected_fingerprint="SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4"
+
+          scanned_key="$(ssh-keyscan -t ed25519 aur.archlinux.org 2>/dev/null)"
+          actual_fingerprint="$(echo "$scanned_key" | ssh-keygen -lf - | awk '{print $2}')"
+
+          if [[ "$actual_fingerprint" != "$expected_fingerprint" ]]; then
+            echo "AUR host key fingerprint mismatch!" >&2
+            echo "Expected: $expected_fingerprint" >&2
+            echo "Got:      $actual_fingerprint" >&2
+            exit 1
+          fi
+
+          echo "$scanned_key" >> ~/.ssh/known_hosts
 
       - name: Publish to AUR
         env:
