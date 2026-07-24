@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'tag'
+        description: 'Тег релиза для публикации (например 1.0.6). Тег должен уже существовать.'
         required: true
         type: string
 
@@ -106,8 +106,10 @@ jobs:
             archlinux:base-devel \
             bash -c "
               set -euo pipefail
-              pacman -Syu --noconfirm rust git namcap
+              pacman -Syu --noconfirm --needed rust git namcap sudo
               useradd --create-home --uid $(id -u) builder
+              echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
+              chmod 440 /etc/sudoers.d/builder
               su builder -c '
                 set -euo pipefail
                 cd /workspace/packaging/aur
@@ -116,6 +118,7 @@ jobs:
                 namcap PKGBUILD
                 namcap ./*.pkg.tar.zst
               '
+              test -f /workspace/packaging/aur/.SRCINFO
             "
 
       - name: Upload prepared PKGBUILD artifacts
@@ -126,6 +129,7 @@ jobs:
             packaging/aur/PKGBUILD
             packaging/aur/.SRCINFO
           retention-days: 1
+          if-no-files-found: error
 
       - name: Upload release binary
         uses: actions/upload-artifact@v4
