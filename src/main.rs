@@ -11,6 +11,18 @@ fn check_thinkpad() {
     }
 }
 
+fn check_fan_control() {
+    let enabled = fs::read_to_string("/sys/module/thinkpad_acpi/parameters/fan_control")
+        .map(|v| v.trim() == "Y")
+        .unwrap_or(false);
+
+    if !enabled {
+        eprintln!("Thinkpad_acpi fan_control is disabled");
+        eprintln!("Run 'fan fix' to enable it");
+        exit(1);
+    }
+}
+
 fn is_root() -> bool {
     env::var("USER").map(|u| u == "root").unwrap_or(false)
         || fs::read_to_string("/proc/self/status")
@@ -23,7 +35,7 @@ fn is_root() -> bool {
             .unwrap_or(false)
 }
 
-fn fan_cmd(cmd: &str) {
+fn ensure_root() {
     if !is_root() {
         let args: Vec<String> = env::args().collect();
         let status = Command::new("sudo")
@@ -32,6 +44,39 @@ fn fan_cmd(cmd: &str) {
             .expect("Failed to run sudo");
         exit(status.code().unwrap_or(1));
     }
+}
+
+fn fan_fix() {
+    ensure_root();
+
+    fs::write(
+        "/etc/modprobe.d/thinkpad_acpi.conf",
+        "options thinkpad_acpi fan_control=1\n",
+    )
+    .expect("Failed to write /etc/modprobe.d/thinkpad_acpi.conf");
+
+    let removed = Command::new("modprobe")
+        .args(["-r", "thinkpad_acpi"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if !removed {
+        eprintln!("Could not unload thinkpad_acpi (module busy?). Reboot to apply.");
+        exit(1);
+    }
+
+    Command::new("modprobe")
+        .arg("thinkpad_acpi")
+        .status()
+        .expect("Failed to run modprobe");
+
+    println!("fan_control=1 applied");
+}
+
+fn fan_cmd(cmd: &str) {
+    check_fan_control();
+    ensure_root();
 
     let content = match cmd {
         "enable" | "disable" => cmd.to_string(),
@@ -56,6 +101,7 @@ fn print_help() {
     println!("        max             set fan to maximum speed");
     println!("        min             set fan to minimum speed");
     println!("        1-7             set fan speed to level 1-7");
+    println!("        fix             enable fan_control in thinkpad_acpi");
 }
 
 fn fan_status() {
@@ -85,6 +131,7 @@ fn run(value: &str) {
         "" | "help" => print_help(),
         "stat" | "info" => fan_status(),
         "w"    => fan_watch(),
+        "fix"  => fan_fix(),
         "on"   => fan_cmd("enable"),
         "off"  => fan_cmd("disable"),
         "max"  => fan_cmd("full-speed"),
