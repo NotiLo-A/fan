@@ -1,10 +1,6 @@
-# fan
+## fan
 
-Command-line tool for controlling ThinkPad fan speed through `/proc/acpi/ibm/fan`.
-
-## Requirements
-
-- ThinkPad with `thinkpad_acpi` kernel module loaded
+CLI tool for ThinkPad fan speed control
 
 ## Install
 
@@ -29,15 +25,16 @@ sudo install -Dm755 target/release/fan /usr/local/bin/fan
 fan <value>
 ```
 
-| Value          | Effect                          |
-|----------------|---------------------------------|
-| `stat`, `info` | show current status             |
-| `w`            | watch status, updates every 1s  |
-| `on`           | enable fan                      |
-| `off`          | disable fan                     |
-| `auto`         | hand control back to firmware   |
-| `max`          | full speed                      |
-| `min`          | level 1                         |
-| `1`–`7`        | set specific level              |
+| Value          | Effect                              |
+|----------------|-------------------------------------|
+| `help`         | show this help message              |
+| `stat`, `info` | show fan stat                       |
+| `w`            | watch fan stat (updates every 1s)   |
+| `on`           | turn fan on                         |
+| `off`          | turn fan off                        |
+| `auto`         | set fan auto                        |
+| `max`          | set fan full speed                  |
+| `min`          | set fan min speed                   |
+| `1`–`7`        | set fan speed level 1-7             |
+| `fix`          | enable fan_control in thinkpad_acpi |
 
-Commands that write to `/proc/acpi/ibm/fan` require root. If not run as root, the tool re-executes itself with `sudo` automatically.
